@@ -169,6 +169,8 @@ impl Client {
     }
 
     pub fn get_file(&self, requested: &str) -> Option<Vec<u8>> {
+        let requested = crate::paths::decode_request_path(requested);
+        let requested = requested.as_str();
         let cache_key = requested.to_lowercase();
         if let Some(hit) = self.cache.get(&cache_key) {
             return Some(hit.data);

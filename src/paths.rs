@@ -13,6 +13,16 @@ pub fn normalize(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
 }
 
+/// Decode a request URI path: percent-encoding, then UTF-8 or Latin-1.
+/// roBrowser may send `유저인터페이스`, `À¯Àú…`, or raw CP949 `%C0%AF…`.
+pub fn decode_request_path(path: &str) -> String {
+    let raw: Vec<u8> = percent_encoding::percent_decode(path.as_bytes()).collect();
+    match String::from_utf8(raw.clone()) {
+        Ok(s) => s,
+        Err(_) => raw.into_iter().map(|b| char::from(b)).collect(),
+    }
+}
+
 pub fn decode_cp949(bytes: &[u8]) -> String {
     WINDOWS_949
         .decode(bytes, DecoderTrap::Replace)
@@ -80,6 +90,30 @@ mod tests {
         let moji = to_mojibake(korean);
         assert_ne!(moji, korean);
         assert_eq!(decode_mojibake(&moji), korean);
+        assert_eq!(moji, "À¯ÀúÀÎÅÍÆäÀÌ½º");
+        let enc: String = moji
+            .bytes()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+        let decoded = decode_request_path(&format!("/data/texture/{enc}/scroll0down.bmp"));
+        assert!(
+            decode_mojibake(&decoded).contains(korean) || decoded.contains(korean),
+            "decoded={decoded:?} moji={moji:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_utf8_mojibake() {
+        let moji = "À¯ÀúÀÎÅÍÆäÀÌ½º";
+        let enc = percent_encoding::utf8_percent_encode(moji, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+        let path = format!("/data/texture/{enc}/scroll0down.bmp");
+        let decoded = decode_request_path(&path);
+        assert!(
+            decoded.contains(moji),
+            "utf8 percent path should decode to mojibake, got {decoded}"
+        );
+        assert_eq!(decode_mojibake(moji), "유저인터페이스");
     }
 
     #[test]

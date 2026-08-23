@@ -94,3 +94,20 @@ cargo test
 ```
 
 A synthetic 0x200 GRF is built in-memory (no Gravity files required).
+
+### Live ecosystem tests
+
+Ignored by default. They hit HAProxy, the Rust asset server, and the rAthena login proxy:
+
+```powershell
+cargo test --test live_ecosystem -- --ignored --nocapture
+```
+
+| Variable | Default |
+|----------|---------|
+| `RODATA_BASE_URLS` | `https://ro.turoran.com/client,http://rodata-dev.turoran.com:3338` |
+| `RODATA_WS_URLS` | `wss://ro.turoran.com/ws/192.168.11.110:6900` and the matching `ws://rodata-dev…:3338/ws/…` |
+| `ROBROWSER_URL` | `https://ro.turoran.com` |
+| `RODATA_EXPECT_GRFS` | `3` |
+
+Checks: `/api/health`, `clientinfo.xml`, prontera map files, ETag 304, 404, CORS, search, HAProxy `/client/` strip, `Config.local.js` no longer points at `:5999`, WebSocket connect to login, allowlist reject.

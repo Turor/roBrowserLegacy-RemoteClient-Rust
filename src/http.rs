@@ -13,6 +13,7 @@ use axum::Router;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -57,7 +58,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/list-files", get(list_files))
         .route("/ws/{*target}", get(ws::upgrade))
         .fallback(fallback)
-        .layer(CompressionLayer::new())
+        // Do not gzip SPR/ACT/GAT (octet-stream). roBrowser workers parse file
+        // magic (`AC`/`SP`) from the raw body.
+        .layer(
+            CompressionLayer::new().compress_when(
+                DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream")),
+            ),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -168,7 +175,8 @@ async fn list_files(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn fallback(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-    let path = req.uri().path();
+    let path = crate::paths::decode_request_path(req.uri().path());
+    let path = path.as_str();
     if path == "/" {
         match std::fs::read_to_string("index.html") {
             Ok(s) => {
