@@ -22,14 +22,18 @@ pub struct AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let origins: Vec<_> = state
-        .config
-        .cors_origins
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+    let cors = if state.config.cors_any {
+        CorsLayer::new().allow_origin(AllowOrigin::any())
+    } else {
+        let origins: Vec<_> = state
+            .config
+            .cors_origins
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(AllowOrigin::list(origins))
+    };
+    let cors = cors
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,

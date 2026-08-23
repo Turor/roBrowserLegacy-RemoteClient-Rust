@@ -27,6 +27,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
+    pub cors_any: bool,
     pub cors_origins: Vec<String>,
     pub client_respath: PathBuf,
     pub client_dataini: String,
@@ -52,16 +53,25 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let public = env_string("CLIENT_PUBLIC_URL", "http://localhost:8000");
-        let mut cors = vec![
-            public,
-            "http://localhost:8000".into(),
-            "http://127.0.0.1:8000".into(),
-            "http://localhost:8080".into(),
-            "http://127.0.0.1:8080".into(),
-            "http://localhost:3338".into(),
-            "http://127.0.0.1:3338".into(),
-        ];
+        let cors_env = std::env::var("CORS_ORIGINS").unwrap_or_default();
+        let cors_any = cors_env.trim() == "*";
+        let mut cors = if cors_any || cors_env.is_empty() {
+            vec![
+                env_string("CLIENT_PUBLIC_URL", "http://localhost:8000"),
+                "http://localhost:8000".into(),
+                "http://127.0.0.1:8000".into(),
+                "http://localhost:8080".into(),
+                "http://127.0.0.1:8080".into(),
+                "http://localhost:3338".into(),
+                "http://127.0.0.1:3338".into(),
+            ]
+        } else {
+            cors_env
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         cors.sort();
         cors.dedup();
 
@@ -82,6 +92,7 @@ impl Config {
 
         Self {
             port: env_usize("PORT", 3338) as u16,
+            cors_any,
             cors_origins: cors,
             client_respath: PathBuf::from(env_string("CLIENT_RESPATH", "resources")),
             client_dataini: env_string("CLIENT_DATAINI", "DATA.INI"),
