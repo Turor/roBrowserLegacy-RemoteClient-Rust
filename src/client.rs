@@ -171,7 +171,7 @@ impl Client {
     pub fn get_file(&self, requested: &str) -> Option<Vec<u8>> {
         let requested = crate::paths::decode_request_path(requested);
         let requested = requested.as_str();
-        let cache_key = requested.to_lowercase();
+        let cache_key = paths::normalize(requested);
         if let Some(hit) = self.cache.get(&cache_key) {
             return Some(hit.data);
         }
@@ -318,10 +318,10 @@ impl Client {
                 if n >= limit {
                     return n;
                 }
-                let name = paths::decode_cp949(&entry.original_bytes).to_lowercase();
-                if patterns.iter().any(|p| name.contains(p)) {
+                let name = paths::decode_cp949(&entry.original_bytes);
+                if patterns.iter().any(|p| name.to_lowercase().contains(p)) {
                     if let Ok(bytes) = grf.extract(entry) {
-                        self.cache.set(name.clone(), bytes);
+                        self.cache.set(paths::normalize(&name), bytes);
                         n += 1;
                     }
                 }

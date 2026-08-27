@@ -85,6 +85,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_keys_match_http_and_grf_names() {
+        assert_eq!(
+            normalize(r"data\texture\유저인터페이스\btn.bmp"),
+            normalize("data/texture/유저인터페이스/btn.bmp")
+        );
+        assert_eq!(
+            normalize("DATA/Texture/A.BMP"),
+            "data/texture/a.bmp"
+        );
+    }
+
+    #[test]
     fn korean_roundtrip_mojibake() {
         let korean = "유저인터페이스";
         let moji = to_mojibake(korean);

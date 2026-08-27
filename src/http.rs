@@ -221,7 +221,7 @@ async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response 
         }
     }
 
-    if let Some(cached) = state.client.cache.get(&rel.to_lowercase()) {
+    if let Some(cached) = state.client.cache.get(&crate::paths::normalize(rel)) {
         if let Some(inm) = req.headers().get(header::IF_NONE_MATCH) {
             if inm.to_str().ok() == Some(&format!("\"{}\"", cached.etag)) {
                 return StatusCode::NOT_MODIFIED.into_response();

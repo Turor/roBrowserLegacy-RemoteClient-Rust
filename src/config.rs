@@ -17,6 +17,18 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+fn resolve_data_ini(respath: &std::path::Path, configured: &str) -> String {
+    if respath.join(configured).is_file() {
+        return configured.to_string();
+    }
+    for name in ["DATA.INI", "Data.ini", "data.ini"] {
+        if respath.join(name).is_file() {
+            return name.to_string();
+        }
+    }
+    configured.to_string()
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -101,7 +113,10 @@ impl Config {
             cors_any,
             cors_origins: cors,
             client_respath: PathBuf::from(env_string("CLIENT_RESPATH", "resources")),
-            client_dataini: env_string("CLIENT_DATAINI", "DATA.INI"),
+            client_dataini: resolve_data_ini(
+                &PathBuf::from(env_string("CLIENT_RESPATH", "resources")),
+                &env_string("CLIENT_DATAINI", "DATA.INI"),
+            ),
             auto_extract: env_bool("CLIENT_AUTOEXTRACT", true),
             enable_search: env_bool("CLIENT_ENABLESEARCH", true),
             grf_encoding: env_string("GRF_ENCODING", "CP949"),
