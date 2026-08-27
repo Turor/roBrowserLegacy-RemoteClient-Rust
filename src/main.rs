@@ -16,6 +16,7 @@ mod doctor;
 mod grf;
 mod http;
 mod ini;
+mod metrics;
 mod paths;
 mod ws;
 
@@ -87,10 +88,14 @@ async fn serve() -> Result<(), String> {
     );
 
     let client = Client::init(config.clone())?;
+    let http_metrics = metrics::HttpMetrics::new();
     let state = Arc::new(AppState {
         config: config.clone(),
         client: client.clone(),
+        metrics: http_metrics.clone(),
     });
+
+    metrics::spawn_reporter(config.clone(), client.clone(), http_metrics);
 
     let app = http::router(state.clone());
     let addr = format!("0.0.0.0:{}", config.port);

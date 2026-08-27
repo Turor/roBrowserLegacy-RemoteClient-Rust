@@ -147,6 +147,108 @@ async fn prontera_map_assets_exist() {
     }
 }
 
+/// GAT cell records are 20 bytes after a 14-byte `GRAT` header.
+const GAT_HEADER: usize = 14;
+const GAT_CELL: usize = 20;
+
+/// kRO remade Izlude again after the 2012 Renewal (268×268) layout.
+/// Hercules `PACKETVER=20190530` RE map-cache is the later 268×300 map.
+/// Pre-RE is 128×128. The 2012 RE overlay in `translation.grf` is 268×268.
+const IZLUD_MODERN_W: u32 = 268;
+const IZLUD_MODERN_H: u32 = 300;
+const IZLUD_PRE_RE_WH: (u32, u32) = (128, 128);
+const IZLUD_RE_2012_WH: (u32, u32) = (268, 268);
+
+fn parse_gat_size(bytes: &[u8]) -> (u32, u32) {
+    assert!(
+        bytes.len() >= GAT_HEADER,
+        "GAT too small ({} bytes)",
+        bytes.len()
+    );
+    assert!(
+        bytes.starts_with(b"GRAT"),
+        "GAT magic {:?}, expected GRAT",
+        &bytes[..4.min(bytes.len())]
+    );
+    let w = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
+    let h = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
+    let expect = GAT_HEADER + (w as usize) * (h as usize) * GAT_CELL;
+    assert_eq!(
+        bytes.len(),
+        expect,
+        "GAT {w}x{h} should be {expect} bytes, got {}",
+        bytes.len()
+    );
+    (w, h)
+}
+
+/// Fail if Izlude is still the Pre-RE island or the 2012 Renewal town.
+/// Hercules RE 20190530 walks the later 268×300 remake from `data.grf`.
+#[tokio::test]
+#[ignore = "live Turoran ecosystem"]
+async fn izlude_is_modern_renewal_map() {
+    let client = http();
+    for base in bases() {
+        let gat_url = join(&base, "data/izlude.gat");
+        let res = client.get(&gat_url).send().await.expect(&gat_url);
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "{gat_url} {} (izlude.gat must be served)",
+            res.status()
+        );
+        let gat = res.bytes().await.expect(&gat_url);
+        let (w, h) = parse_gat_size(&gat);
+        assert_ne!(
+            (w, h),
+            IZLUD_PRE_RE_WH,
+            "{gat_url}: Pre-RE Izlude {w}x{h} — Hercules RE uses the remake"
+        );
+        assert_ne!(
+            (w, h),
+            IZLUD_RE_2012_WH,
+            "{gat_url}: 2012 Renewal Izlude {w}x{h} — translation.grf/Data overlay is masking data.grf (need 268x300)"
+        );
+        assert_eq!(
+            (w, h),
+            (IZLUD_MODERN_W, IZLUD_MODERN_H),
+            "{gat_url}: expected modern Izlude {IZLUD_MODERN_W}x{IZLUD_MODERN_H}, got {w}x{h}"
+        );
+
+        for name in ["data/izlude.gnd", "data/izlude.rsw"] {
+            let url = join(&base, name);
+            let res = client.get(&url).send().await.expect(&url);
+            assert_eq!(res.status(), StatusCode::OK, "{url} {}", res.status());
+            let n = res.bytes().await.expect(&url).len();
+            assert!(n > 1000, "{url}: {n} bytes");
+            eprintln!("ok izlude mesh {url} {n} bytes");
+        }
+
+        // Instance copies must match the same walkable size as izlude.gat.
+        for inst in ["izlude_a", "izlude_b", "izlude_c", "izlude_d"] {
+            let url = join(&base, &format!("data/{inst}.gat"));
+            let res = client.get(&url).send().await.expect(&url);
+            if res.status() != StatusCode::OK {
+                eprintln!("skip {url}: {}", res.status());
+                continue;
+            }
+            let bytes = res.bytes().await.expect(&url);
+            let (iw, ih) = parse_gat_size(&bytes);
+            assert_eq!(
+                (iw, ih),
+                (IZLUD_MODERN_W, IZLUD_MODERN_H),
+                "{url}: instance GAT {iw}x{ih} must match modern izlude"
+            );
+            eprintln!("ok izlude instance {url} {iw}x{ih}");
+        }
+
+        eprintln!(
+            "ok modern izlude {gat_url} {w}x{h} {} bytes",
+            gat.len()
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "live Turoran ecosystem"]
 async fn etag_yields_304_on_revalidate() {

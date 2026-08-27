@@ -3,10 +3,12 @@
 use crate::cache::etag_for;
 use crate::client::Client;
 use crate::config::Config;
+use crate::metrics::HttpMetrics;
 use crate::ws;
 use axum::body::Body;
-use axum::extract::{Json, State};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::extract::{Json, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -20,6 +22,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 pub struct AppState {
     pub config: Config,
     pub client: Arc<Client>,
+    pub metrics: Arc<HttpMetrics>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -58,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/list-files", get(list_files))
         .route("/ws/{*target}", get(ws::upgrade))
         .fallback(fallback)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), track_mw))
         // Do not gzip SPR/ACT/GAT (octet-stream). roBrowser workers parse file
         // magic (`AC`/`SP`) from the raw body.
         .layer(
@@ -67,6 +71,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .layer(cors)
         .with_state(state)
+}
+
+async fn track_mw(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    crate::metrics::track(state.metrics.clone(), req, next).await
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -174,7 +182,7 @@ async fn list_files(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(state.client.list_files())
 }
 
-async fn fallback(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let path = crate::paths::decode_request_path(req.uri().path());
     let path = path.as_str();
     if path == "/" {
@@ -288,21 +296,28 @@ fn file_response_headers(path: &str, bytes: Vec<u8>, esrgan: bool, etag: Option<
         header::HeaderValue::from_str(&mime)
             .unwrap_or(header::HeaderValue::from_static("application/octet-stream")),
     );
-    if is_static_asset(path) {
+    if is_map_geometry(path) {
+        // GAT/GND/RSW change when GRFs are swapped; `immutable` would keep a
+        // pre-RE Izlude in the browser for a day even after a correct 304 ETag.
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("public, max-age=0, must-revalidate"),
+        );
+    } else if is_static_asset(path) {
         headers.insert(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("public, max-age=86400, immutable"),
         );
-        if let Some(e) = etag {
-            if let Ok(v) = header::HeaderValue::from_str(&format!("\"{e}\"")) {
-                headers.insert(header::ETAG, v);
-            }
-        }
     } else {
         headers.insert(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         );
+    }
+    if let Some(e) = etag {
+        if let Ok(v) = header::HeaderValue::from_str(&format!("\"{e}\"")) {
+            headers.insert(header::ETAG, v);
+        }
     }
     if esrgan {
         headers.insert(
@@ -311,6 +326,11 @@ fn file_response_headers(path: &str, bytes: Vec<u8>, esrgan: bool, etag: Option<
         );
     }
     (headers, bytes).into_response()
+}
+
+fn is_map_geometry(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".gat") || p.ends_with(".gnd") || p.ends_with(".rsw")
 }
 
 fn is_static_asset(path: &str) -> bool {

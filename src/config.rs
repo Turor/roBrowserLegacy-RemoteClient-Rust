@@ -49,6 +49,12 @@ pub struct Config {
     pub esrgan_enabled: bool,
     pub esrgan_cache_dir: PathBuf,
     pub missing_log_file: PathBuf,
+    pub influx_url: String,
+    pub influx_token: String,
+    pub influx_org: String,
+    pub influx_bucket: String,
+    pub influx_host: String,
+    pub influx_interval_secs: u64,
 }
 
 impl Config {
@@ -117,6 +123,12 @@ impl Config {
                 "MISSING_LOG_FILE",
                 "logs/missing-files.log",
             )),
+            influx_url: env_string("INFLUX_URL", ""),
+            influx_token: env_string("INFLUX_TOKEN", ""),
+            influx_org: env_string("INFLUX_ORG", "turoran"),
+            influx_bucket: env_string("INFLUX_BUCKET", "metrics"),
+            influx_host: env_string("INFLUX_HOST", "rodata"),
+            influx_interval_secs: env_usize("INFLUX_INTERVAL_SECS", 15) as u64,
         }
     }
 }
