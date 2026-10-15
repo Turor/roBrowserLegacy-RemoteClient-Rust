@@ -221,6 +221,12 @@ async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response 
         }
     }
 
+    // Loose overlay files win over the GRF memory cache.
+    let decoded = crate::paths::decode_request_path(rel);
+    if let Some(bytes) = state.client.overlay_file(&decoded) {
+        return file_response(&req, rel, bytes, false);
+    }
+
     if let Some(cached) = state.client.cache.get(&crate::paths::normalize(rel)) {
         if let Some(inm) = req.headers().get(header::IF_NONE_MATCH) {
             if inm.to_str().ok() == Some(&format!("\"{}\"", cached.etag)) {
@@ -303,6 +309,12 @@ fn file_response_headers(path: &str, bytes: Vec<u8>, esrgan: bool, etag: Option<
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("public, max-age=0, must-revalidate"),
         );
+    } else if is_text_data(path) {
+        // Lua/lub/txt/xml tables get edited in place; revalidate via ETag.
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-cache"),
+        );
     } else if is_static_asset(path) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -331,6 +343,11 @@ fn file_response_headers(path: &str, bytes: Vec<u8>, esrgan: bool, etag: Option<
 fn is_map_geometry(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     p.ends_with(".gat") || p.ends_with(".gnd") || p.ends_with(".rsw")
+}
+
+fn is_text_data(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [".lub", ".lua", ".txt", ".xml"].iter().any(|e| lower.ends_with(e))
 }
 
 fn is_static_asset(path: &str) -> bool {

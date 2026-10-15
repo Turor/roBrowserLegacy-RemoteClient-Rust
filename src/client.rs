@@ -172,26 +172,15 @@ impl Client {
         let requested = crate::paths::decode_request_path(requested);
         let requested = requested.as_str();
         let cache_key = paths::normalize(requested);
+        // Overlays (disk under cwd, then DATA_OVERRIDE_PATH) always win over GRF
+        // entries and are never memory-cached, so edits/renames show up without a restart.
+        if let Some(bytes) = self.overlay_file(requested) {
+            return Some(bytes);
+        }
         if let Some(hit) = self.cache.get(&cache_key) {
             return Some(hit.data);
         }
-
         let rel = requested.trim_start_matches('/');
-        if let Some(bytes) = read_if_file(Path::new(rel)) {
-            self.cache.set(cache_key, bytes.clone());
-            return Some(bytes);
-        }
-
-        if let Some(over) = &self.config.data_override_path {
-            let stripped = rel
-                .strip_prefix("data/")
-                .or_else(|| rel.strip_prefix("data\\"))
-                .unwrap_or(rel);
-            if let Some(bytes) = read_if_file(&over.join(stripped)) {
-                self.cache.set(cache_key, bytes.clone());
-                return Some(bytes);
-            }
-        }
 
         if let Some(bytes) = self.from_index(requested) {
             let mut bytes = bytes;
@@ -208,6 +197,27 @@ impl Client {
         }
 
         self.log_missing(requested);
+        None
+    }
+
+    /// Loose file overlay: `./<path>` then `DATA_OVERRIDE_PATH/<path without data/>`.
+    pub fn overlay_file(&self, requested: &str) -> Option<Vec<u8>> {
+        let rel = requested.trim_start_matches('/');
+        if rel.contains("..") {
+            return None;
+        }
+        if let Some(bytes) = read_if_file(Path::new(rel)) {
+            return Some(bytes);
+        }
+        if let Some(over) = &self.config.data_override_path {
+            let stripped = rel
+                .strip_prefix("data/")
+                .or_else(|| rel.strip_prefix("data\\"))
+                .unwrap_or(rel);
+            if let Some(bytes) = read_if_file(&over.join(stripped)) {
+                return Some(bytes);
+            }
+        }
         None
     }
 
