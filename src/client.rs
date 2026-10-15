@@ -209,6 +209,13 @@ impl Client {
         if let Some(bytes) = read_if_file(Path::new(rel)) {
             return Some(bytes);
         }
+        // Generated text overlays mirroring GRF paths, stored lowercase/slash-normalized
+        // (e.g. System/overlay/data/luafiles514/lua files/skillinfoz/skillid.turoran4.lub).
+        if let Some(root) = &self.config.overlay_path {
+            if let Some(bytes) = read_if_file(&root.join(paths::normalize(rel))) {
+                return Some(bytes);
+            }
+        }
         if let Some(over) = &self.config.data_override_path {
             let stripped = rel
                 .strip_prefix("data/")
