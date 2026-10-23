@@ -169,6 +169,10 @@ async fn batch(State(state): State<Arc<AppState>>, Json(body): Json<BatchBody>) 
     }
     let mut map = serde_json::Map::new();
     for f in body.files {
+        let decoded = crate::paths::decode_request_path(&f);
+        if !crate::paths::is_allowed_asset_path(&decoded) {
+            continue;
+        }
         if let Some(bytes) = state.client.get_file(&f) {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -196,8 +200,14 @@ async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response 
         }
     }
 
+    let rel = path.trim_start_matches('/');
+    // Never serve hidden files/dirs (.env, .git, ...) or traversal segments, from any source.
+    if crate::paths::has_hidden_or_traversal_segment(rel) {
+        return not_found();
+    }
+
     // ESRGAN overlay
-    if state.config.esrgan_enabled {
+    if state.config.esrgan_enabled && crate::paths::is_allowed_asset_path(rel) {
         if let Some(png) = esrgan_lookup(&state.config.esrgan_cache_dir, path) {
             return file_response(&req, path, png, true);
         }
@@ -210,7 +220,12 @@ async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response 
         }
     }
 
-    let rel = path.trim_start_matches('/');
+    // Client asset allowlist: only data/, BGM/, System/, SystemEN/, AI/ are served from
+    // the working folder / overlays / GRFs. Everything else (.env, src/, plan.md, logs/,
+    // Cargo.toml, resources/*.grf, ...) is a 404.
+    if !crate::paths::is_allowed_asset_path(rel) {
+        return not_found();
+    }
     if state.config.restrict_asset_paths {
         let ok = rel.starts_with("data/")
             || rel.starts_with("data\\")
@@ -238,15 +253,17 @@ async fn fallback(State(state): State<Arc<AppState>>, req: Request) -> Response 
 
     match state.client.get_file(rel) {
         Some(bytes) => file_response(&req, rel, bytes, false),
-        None => {
-            let mut res = (StatusCode::NOT_FOUND, "File not found").into_response();
-            res.headers_mut().insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
-            res
-        }
+        None => not_found(),
     }
+}
+
+fn not_found() -> Response {
+    let mut res = (StatusCode::NOT_FOUND, "File not found").into_response();
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    res
 }
 
 fn esrgan_lookup(dir: &Path, url_path: &str) -> Option<Vec<u8>> {

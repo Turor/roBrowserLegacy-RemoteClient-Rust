@@ -206,6 +206,11 @@ impl Client {
         if rel.contains("..") {
             return None;
         }
+        // Defense in depth: the working folder holds .env, src/, logs/ etc. Only
+        // allowlisted client asset roots may ever be read from disk.
+        if !crate::paths::is_allowed_asset_path(rel) {
+            return None;
+        }
         if let Some(bytes) = read_if_file(Path::new(rel)) {
             return Some(bytes);
         }
