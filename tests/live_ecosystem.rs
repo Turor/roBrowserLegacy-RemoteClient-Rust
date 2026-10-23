@@ -544,3 +544,47 @@ async fn websocket_proxy_rejects_non_allowlisted_target() {
         Err(_) => panic!("{blocked}: timed out (allowlist should fail fast)"),
     }
 }
+
+/// Working-folder files (.env with secrets, sources, notes, logs) must never be served.
+#[tokio::test]
+#[ignore = "live Turoran ecosystem"]
+async fn working_folder_files_are_not_served() {
+    let http = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let sensitive = [
+        ".env",
+        ".ENV",
+        ".env.test",
+        "%2eenv",
+        ".git/config",
+        ".gitignore",
+        "src/main.rs",
+        "src/http.rs",
+        "plan.md",
+        "README.md",
+        "Cargo.toml",
+        "path-mapping.json",
+        "logs/missing-files.log",
+        "data/../.env",
+        "data/%2e%2e/.env",
+        "System/.git/config",
+    ];
+    for base in bases() {
+        for p in sensitive {
+            let url = format!("{}/{}", base.trim_end_matches('/'), p);
+            let res = http.get(&url).send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{url}");
+        }
+        let res = http
+            .post(format!("{}/batch", base.trim_end_matches('/')))
+            .json(&serde_json::json!({ "files": [".env", "src/main.rs", "plan.md"] }))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "{base}/batch");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body.as_object().map(|o| o.len()), Some(0), "{base}/batch leaked files");
+    }
+}

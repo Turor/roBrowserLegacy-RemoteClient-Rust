@@ -13,6 +13,41 @@ pub fn normalize(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
 }
 
+/// Top-level directories the roBrowser client legitimately requests
+/// (verified against HAProxy access logs and the roBrowser source).
+/// Matched case-insensitively on the first path segment.
+pub const ALLOWED_ASSET_ROOTS: &[&str] = &["data", "bgm", "system", "systemen", "ai"];
+
+/// True if any segment (split on `/` or `\\`) is hidden (starts with `.`, which also
+/// covers `.` / `..` traversal segments) or the path contains a NUL byte.
+/// `rel` must already be percent-decoded.
+pub fn has_hidden_or_traversal_segment(rel: &str) -> bool {
+    if rel.contains('\0') {
+        return true;
+    }
+    rel.trim_start_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .any(|seg| seg.starts_with('.'))
+}
+
+/// Allowlist for file serving: the path (already percent-decoded) must start with one
+/// of [`ALLOWED_ASSET_ROOTS`] (case-insensitive), have at least one segment below it,
+/// and contain no hidden or traversal segments. Anything else (`.env`, `src/`,
+/// `plan.md`, `logs/`, `Cargo.toml`, GRF resources, ...) must not be served.
+pub fn is_allowed_asset_path(rel: &str) -> bool {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() || has_hidden_or_traversal_segment(rel) {
+        return false;
+    }
+    let mut segs = rel.split(['/', '\\']);
+    let first = segs.next().unwrap_or("");
+    let rest_non_empty = segs.any(|s| !s.is_empty());
+    rest_non_empty
+        && ALLOWED_ASSET_ROOTS
+            .iter()
+            .any(|root| first.eq_ignore_ascii_case(root))
+}
+
 /// Decode a request URI path: percent-encoding, then UTF-8 or Latin-1.
 /// roBrowser may send `유저인터페이스`, `À¯Àú…`, or raw CP949 `%C0%AF…`.
 pub fn decode_request_path(path: &str) -> String {
@@ -131,5 +166,87 @@ mod tests {
     #[test]
     fn normalize_slashes() {
         assert_eq!(normalize(r"Data\Texture\A.TGA"), "data/texture/a.tga");
+    }
+
+    #[test]
+    fn allowlist_permits_client_asset_roots() {
+        for p in [
+            "data/sprite/a.spr",
+            "/data/texture/x.bmp",
+            "DATA\\sprite\\a.spr",
+            "Data/luafiles514/lua files/x.lub",
+            "data\\texture\\\u{c720}\u{c800}\u{c778}\u{d130}\u{d398}\u{c774}\u{c2a4}\\a.bmp",
+            "data/texture/\u{c0}\u{af}\u{c0}\u{fa}/a.bmp",
+            "BGM/01.mp3",
+            "bgm/01.mp3",
+            "System/itemInfo.turoran.renewal11.lua",
+            "System/Font/SCDream4.otf",
+            "SystemEN/achievements.lub",
+            "systemen/towninfo.lub",
+            "AI/USER_AI/AI.lua",
+            "AI/Util.lua",
+            "data/foo.bar.baz",
+            "data/sprite/a..b.spr",
+        ] {
+            assert!(is_allowed_asset_path(p), "should allow {p}");
+        }
+    }
+
+    #[test]
+    fn allowlist_denies_dotfiles_configs_and_traversal() {
+        for p in [
+            "",
+            "/",
+            ".env",
+            "/.env",
+            ".ENV",
+            ".Env.Test",
+            ".env.test",
+            ".env.bak-pre0716-20261016_164532",
+            ".git/config",
+            ".gitignore",
+            "src/main.rs",
+            "src/http.rs",
+            "plan.md",
+            "README.md",
+            "Cargo.toml",
+            "Cargo.lock",
+            "path-mapping.json",
+            "index.html",
+            "logs/missing-files.log",
+            "backups/x",
+            "resources/data.grf",
+            "target/release/remoteclient2",
+            "tests/live_ecosystem.rs",
+            "overlay-0716/x.lub",
+            "data",
+            "data/",
+            "BGM",
+            "data/.hidden",
+            "data/.HTACCESS",
+            "data/../.env",
+            "data\\..\\.env",
+            "data/sub/../../src/main.rs",
+            "System/.git/config",
+            "AI/.env",
+            "data/a\0.spr",
+            "\\.env",
+            "//.env",
+            "dataX/a.spr",
+            "systemx/a.lub",
+            "/etc/passwd",
+        ] {
+            assert!(!is_allowed_asset_path(p), "should deny {p:?}");
+        }
+    }
+
+    #[test]
+    fn allowlist_applies_after_percent_decoding() {
+        for raw in ["/%2eenv", "/%2Eenv", "/data/%2e%2e/.env", "/data/..%5c.env", "/data%2f..%2f.env", "/%2e%65nv"] {
+            let d = decode_request_path(raw);
+            assert!(!is_allowed_asset_path(&d), "should deny {raw} -> {d:?}");
+        }
+        let d = decode_request_path("/data/texture/%C0%AF%C0%FA/a.bmp");
+        assert!(is_allowed_asset_path(&d));
     }
 }
