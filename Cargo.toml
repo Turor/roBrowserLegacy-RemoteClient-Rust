@@ -30,6 +30,9 @@ http-body-util = "0.1"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+sha2 = "0.10"
+walkdir = "2"
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
