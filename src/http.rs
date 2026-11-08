@@ -23,6 +23,7 @@ pub struct AppState {
     pub config: Config,
     pub client: Arc<Client>,
     pub metrics: Arc<HttpMetrics>,
+    pub asset_snapshot: Option<Arc<crate::assets::AssetSnapshot>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -47,6 +48,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .allow_headers(tower_http::cors::Any);
 
     Router::new()
+        .route("/api/assets/v1/manifest", get(crate::assets::manifest))
+        .route("/api/assets/v1/blobs/{digest}", get(crate::assets::blob))
         .route("/api/health", get(health))
         .route("/api/health/simple", get(health_simple))
         .route("/api/cache-stats", get(cache_stats))
@@ -61,14 +64,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/list-files", get(list_files))
         .route("/ws/{*target}", get(ws::upgrade))
         .fallback(fallback)
-        .layer(axum::middleware::from_fn_with_state(state.clone(), track_mw))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            track_mw,
+        ))
         // Do not gzip SPR/ACT/GAT (octet-stream). roBrowser workers parse file
         // magic (`AC`/`SP`) from the raw body.
-        .layer(
-            CompressionLayer::new().compress_when(
-                DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream")),
-            ),
-        )
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new("application/octet-stream")),
+        ))
         .layer(cors)
         .with_state(state)
 }
@@ -364,7 +368,9 @@ fn is_map_geometry(path: &str) -> bool {
 
 fn is_text_data(path: &str) -> bool {
     let lower = path.to_lowercase();
-    [".lub", ".lua", ".txt", ".xml"].iter().any(|e| lower.ends_with(e))
+    [".lub", ".lua", ".txt", ".xml"]
+        .iter()
+        .any(|e| lower.ends_with(e))
 }
 
 fn is_static_asset(path: &str) -> bool {

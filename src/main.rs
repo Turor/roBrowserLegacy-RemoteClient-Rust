@@ -8,6 +8,7 @@
 //! - `parking_lot::Mutex` ≈ a synchronized block around mutable fields
 //! - errors are `Result` (no exceptions); `?` is like Kotlin's early return
 
+mod assets;
 mod bmp;
 mod cache;
 mod client;
@@ -41,6 +42,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build an immutable, allowlisted raw-asset snapshot (does not deploy it).
+    BuildAssetSnapshot {
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
     /// Run the HTTP + WS server (default)
     Serve,
     /// Validate GRFs and DATA.INI
@@ -61,6 +67,22 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd.unwrap_or(Command::Serve) {
+        Command::BuildAssetSnapshot { output } => {
+            let result = Client::init(Config::from_env())
+                .and_then(|client| assets::build_snapshot(&client, &output));
+            match result {
+                Ok(()) => {
+                    println!("Asset snapshot written; not deployed.");
+                    ExitCode::SUCCESS
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Asset snapshot failed; output is incomplete and must not be served."
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Doctor { deep, json } => ExitCode::from(doctor::run(deep, json) as u8),
         Command::ConvertEncoding { output } => {
             ExitCode::from(doctor::convert_encoding(&output) as u8)
@@ -93,6 +115,9 @@ async fn serve() -> Result<(), String> {
         config: config.clone(),
         client: client.clone(),
         metrics: http_metrics.clone(),
+        asset_snapshot: std::env::var_os("ASSET_SNAPSHOT_PATH")
+            .map(|path| assets::AssetSnapshot::open(std::path::Path::new(&path)).map(Arc::new))
+            .transpose()?,
     });
 
     metrics::spawn_reporter(config.clone(), client.clone(), http_metrics);
