@@ -16,6 +16,7 @@ mod config;
 mod doctor;
 mod grf;
 mod http;
+mod korangar_releases;
 mod ini;
 mod metrics;
 mod paths;
@@ -118,7 +119,11 @@ async fn serve() -> Result<(), String> {
         asset_snapshot: std::env::var_os("ASSET_SNAPSHOT_PATH")
             .map(|path| assets::AssetSnapshot::open(std::path::Path::new(&path)).map(Arc::new))
             .transpose()?,
+        korangar_releases: korangar_releases::Service::from_env().map(Arc::new),
     });
+    if state.korangar_releases.is_some() {
+        info!("Korangar main-channel presign endpoint enabled");
+    }
 
     metrics::spawn_reporter(config.clone(), client.clone(), http_metrics);
 

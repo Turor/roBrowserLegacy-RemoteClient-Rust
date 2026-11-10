@@ -516,6 +516,7 @@ mod integration_tests {
                 client: client.clone(),
                 metrics: HttpMetrics::new(),
                 asset_snapshot: enabled,
+                korangar_releases: None,
             })
         };
         let app = crate::http::router(state(Some(snapshot)));
