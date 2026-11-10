@@ -390,19 +390,20 @@ impl Service {
             120,
             SystemTime::now(),
         )?;
+        // Do not include the reqwest error display: it can contain the presigned URL.
         let response = self
             .http
             .get(url)
             .send()
             .await
-            .map_err(|e| format!("s3 get failed: {e}"))?;
+            .map_err(|_| "s3 get failed".to_string())?;
         if !response.status().is_success() {
             return Err(format!("s3 get status {}", response.status()));
         }
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| format!("s3 body: {e}"))?;
+            .map_err(|_| "s3 body read failed".to_string())?;
         if bytes.len() > limit {
             return Err("s3 object too large".into());
         }
