@@ -111,3 +111,7 @@ cargo test --test live_ecosystem -- --ignored --nocapture
 | `RODATA_EXPECT_GRFS` | `3` |
 
 Checks: `/api/health`, `clientinfo.xml`, prontera map files, ETag 304, 404, CORS, search, HAProxy `/client/` strip, `Config.local.js` no longer points at `:5999`, WebSocket connect to login, allowlist reject.
+
+## Korangar release catalog
+
+`GET /korangar/main/latest` (publicly `https://ro.turoran.com/client/korangar/main/latest`) returns short-lived presigned GET URLs for the private Garage bucket `korangar-releases`. The read-only key is loaded from the process environment (systemd `EnvironmentFile=/etc/remoteclient2/korangar-releases-reader.env`) and is not in this tree or the web-served working folder. The endpoint only signs objects under `main/` with allowlisted names, and is rate-limited per client IP.
