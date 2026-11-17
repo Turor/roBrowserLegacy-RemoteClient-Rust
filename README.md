@@ -115,3 +115,5 @@ Checks: `/api/health`, `clientinfo.xml`, prontera map files, ETag 304, 404, CORS
 ## Korangar release catalog
 
 `GET /korangar/main/latest` (publicly `https://ro.turoran.com/client/korangar/main/latest`) returns short-lived presigned GET URLs for the private Garage bucket `korangar-releases`. The read-only key is loaded from the process environment (systemd `EnvironmentFile=/etc/remoteclient2/korangar-releases-reader.env`) and is not in this tree or the web-served working folder. The endpoint only signs objects under `main/` with allowlisted names, and is rate-limited per client IP.
+
+`GET /goro/main/latest` (publicly `https://ro.turoran.com/client/goro/main/latest`) is the same catalog for the goro client: it reads `goro/main/manifest.goroup` (GORO1) from the same bucket and key, and only presigns `goro/main/manifest.goroup` and `goro/main/goro-<linux|windows|darwin>-<amd64|arm64>-<sha>[.exe]`. Each channel only presigns its own names.

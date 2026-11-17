@@ -3,6 +3,10 @@
 //! `GET /korangar/main/latest` (publicly `https://ro.turoran.com/client/korangar/main/latest`)
 //! returns short-lived GET URLs for `main/manifest.jsonup` and the binaries it names.
 //! The bucket stays private; this service holds a read-only key that is never web-served.
+//!
+//! `GET /goro/main/latest` (publicly `https://ro.turoran.com/client/goro/main/latest`)
+//! does the same for the goro client: objects under `goro/main/` in the same bucket,
+//! manifest `goro/main/manifest.goroup` (GORO1), binaries `goro-<os>-<arch>-<sha>[.exe]`.
 
 use crate::http::AppState;
 use axum::extract::State;
@@ -22,11 +26,57 @@ const DEFAULT_PUBLIC_ENDPOINT: &str = "https://garage.turoran.com";
 const DEFAULT_REGION: &str = "garage";
 const DEFAULT_EXPIRES: u64 = 600;
 const PREFIX: &str = "main/";
-const MANIFEST_KEY: &str = "main/manifest.jsonup";
+const GORO_PREFIX: &str = "goro/main/";
 const MANIFEST_LIMIT: usize = 256 * 1024;
 const MAX_FILES: usize = 8;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// A release channel served from the private bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// Korangar main: `main/manifest.jsonup` (KRUP1), `korangar-*` binaries.
+    Korangar,
+    /// goro main: `goro/main/manifest.goroup` (GORO1), `goro-*` binaries.
+    Goro,
+}
+
+impl Channel {
+    fn prefix(self) -> &'static str {
+        match self {
+            Channel::Korangar => PREFIX,
+            Channel::Goro => GORO_PREFIX,
+        }
+    }
+
+    fn manifest_key(self) -> &'static str {
+        match self {
+            Channel::Korangar => "main/manifest.jsonup",
+            Channel::Goro => "goro/main/manifest.goroup",
+        }
+    }
+
+    fn magic(self) -> (&'static str, &'static str) {
+        match self {
+            Channel::Korangar => ("KRUP1SIG", "KRUP1"),
+            Channel::Goro => ("GORO1SIG", "GORO1"),
+        }
+    }
+
+    fn allows(self, name: &str) -> bool {
+        match self {
+            Channel::Korangar => allowed_object_name(name),
+            Channel::Goro => goro_allowed_object_name(name),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Channel::Korangar => "korangar",
+            Channel::Goro => "goro",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Service {
@@ -186,26 +236,69 @@ fn is_hex_sha(s: &str) -> bool {
     (7..=64).contains(&n) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// goro object name under `goro/main/`: the manifest, or
+/// `goro-<linux|windows|darwin>-<amd64|arm64>-<sha>` (`.exe` only on Windows).
+pub fn goro_allowed_object_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') || name.contains('%') {
+        return false;
+    }
+    if name.contains("..") || name.starts_with('.') {
+        return false;
+    }
+    if name == "manifest.goroup" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("goro-") else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '-');
+    let (Some(os), Some(arch), Some(tail)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if !matches!(arch, "amd64" | "arm64") {
+        return false;
+    }
+    match os {
+        "windows" => tail.strip_suffix(".exe").is_some_and(is_hex_sha),
+        "linux" | "darwin" => is_hex_sha(tail),
+        _ => false,
+    }
+}
+
 pub fn object_key(name: &str) -> Option<String> {
-    if !allowed_object_name(name) {
+    object_key_for(Channel::Korangar, name)
+}
+
+pub fn object_key_for(channel: Channel, name: &str) -> Option<String> {
+    if !channel.allows(name) {
         return None;
     }
-    Some(format!("{PREFIX}{name}"))
+    Some(format!("{}{name}", channel.prefix()))
 }
 
 /// File names listed in a KRUP1 / KRUP1SIG payload. Does not verify the signature.
 pub fn listed_object_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    listed_object_names_for(Channel::Korangar, bytes)
+}
+
+/// File names listed in a channel's manifest. Does not verify the signature
+/// (the client does); this only decides which objects may be presigned.
+pub fn listed_object_names_for(channel: Channel, bytes: &[u8]) -> Result<Vec<String>, String> {
+    let (envelope, payload) = channel.magic();
     let text = std::str::from_utf8(bytes).map_err(|_| "manifest is not utf-8")?;
     let mut lines = text.lines();
     let first = lines.next().ok_or("empty manifest")?;
-    if first == "KRUP1SIG" {
+    if first == envelope {
         let _sig = lines.next().ok_or("truncated envelope")?;
         let header = lines.next().ok_or("truncated envelope")?;
-        if header != "KRUP1" {
-            return Err("missing KRUP1 header".into());
+        if header != payload {
+            return Err(format!("missing {payload} header"));
         }
-    } else if first != "KRUP1" {
-        return Err("not a KRUP1 manifest".into());
+    } else if first != payload {
+        return Err(format!("not a {payload} manifest"));
     }
     let _version = lines.next().ok_or("missing version")?;
     let _build = lines.next().ok_or("missing build")?;
@@ -224,10 +317,10 @@ pub fn listed_object_names(bytes: &[u8]) -> Result<Vec<String>, String> {
         let _size = lines.next().ok_or("truncated file list")?;
         let url = lines.next().ok_or("truncated file list")?.trim();
         // Only bare, allowlisted names. Never follow a remote or traversed url.
-        if !allowed_object_name(path) {
+        if !channel.allows(path) {
             return Err(format!("refusing to presign {path}"));
         }
-        if !url.is_empty() && url != path && !allowed_object_name(url) {
+        if !url.is_empty() && url != path && !channel.allows(url) {
             return Err(format!("refusing to presign url for {path}"));
         }
         names.push(path.to_string());
@@ -308,11 +401,16 @@ pub fn presign_get(
     if bucket != DEFAULT_BUCKET {
         return Err("refusing to presign a bucket other than korangar-releases".into());
     }
-    if !key.starts_with(PREFIX) || key.contains('\\') || key.contains("..") || key.contains('\0') {
+    if key.contains('\\') || key.contains("..") || key.contains('\0') {
         return Err("refusing to presign key outside main/".into());
     }
-    let name = key.strip_prefix(PREFIX).unwrap_or("");
-    if !allowed_object_name(name) {
+    let allowed = [Channel::Korangar, Channel::Goro]
+        .into_iter()
+        .any(|channel| {
+            key.strip_prefix(channel.prefix())
+                .is_some_and(|name| channel.allows(name))
+        });
+    if !allowed {
         return Err("refusing to presign unexpected object name".into());
     }
     let ep = parse_endpoint(endpoint)?;
@@ -436,6 +534,15 @@ fn client_ip(headers: &HeaderMap) -> IpAddr {
 }
 
 pub async fn latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    serve_latest(&state, &headers, Channel::Korangar).await
+}
+
+/// `GET /goro/main/latest`: the goro client's catalog from the same bucket and key.
+pub async fn goro_latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    serve_latest(&state, &headers, Channel::Goro).await
+}
+
+async fn serve_latest(state: &AppState, headers: &HeaderMap, channel: Channel) -> Response {
     let Some(svc) = state.korangar_releases.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -443,7 +550,7 @@ pub async fn latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         )
             .into_response();
     };
-    let ip = client_ip(&headers);
+    let ip = client_ip(headers);
     if !svc.rate.allow(ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -452,7 +559,7 @@ pub async fn latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         )
             .into_response();
     }
-    match build_latest(svc).await {
+    match build_latest(svc, channel).await {
         Ok(body) => {
             let mut res = axum::Json(body).into_response();
             res.headers_mut().insert(
@@ -462,19 +569,20 @@ pub async fn latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             res
         }
         Err(err) => {
-            tracing::warn!("korangar latest failed: {err}");
+            tracing::warn!("{} latest failed: {err}", channel.label());
             (StatusCode::BAD_GATEWAY, "unable to presign release").into_response()
         }
     }
 }
 
-async fn build_latest(svc: &Service) -> Result<LatestResponse, String> {
-    let manifest = svc.get_object(MANIFEST_KEY, MANIFEST_LIMIT).await?;
-    let names = listed_object_names(&manifest)?;
-    let manifest_url = svc.presign_public(MANIFEST_KEY)?;
+async fn build_latest(svc: &Service, channel: Channel) -> Result<LatestResponse, String> {
+    let manifest_key = channel.manifest_key();
+    let manifest = svc.get_object(manifest_key, MANIFEST_LIMIT).await?;
+    let names = listed_object_names_for(channel, &manifest)?;
+    let manifest_url = svc.presign_public(manifest_key)?;
     let mut files = Vec::with_capacity(names.len());
     for name in names {
-        let key = object_key(&name).ok_or_else(|| format!("bad name {name}"))?;
+        let key = object_key_for(channel, &name).ok_or_else(|| format!("bad name {name}"))?;
         files.push(FileUrl {
             path: name,
             url: svc.presign_public(&key)?,
@@ -601,6 +709,91 @@ korangar-windows-ebc2a7a7bb0bcd67a6cd8345ada1d466fe4d3a33.exe
             now,
         )
         .is_err());
+    }
+
+    const GORO_SHA: &str = "2a6f056b3707c27e9496c149fb344278eae6ca80";
+
+    #[test]
+    fn goro_object_names_are_strict() {
+        assert!(goro_allowed_object_name("manifest.goroup"));
+        assert!(goro_allowed_object_name(&format!(
+            "goro-linux-amd64-{GORO_SHA}"
+        )));
+        assert!(goro_allowed_object_name(&format!(
+            "goro-windows-amd64-{GORO_SHA}.exe"
+        )));
+        assert!(goro_allowed_object_name(&format!(
+            "goro-linux-arm64-{GORO_SHA}"
+        )));
+        for bad in [
+            "manifest.jsonup".to_string(),
+            format!("korangar-linux-{GORO_SHA}"),
+            format!("goro-windows-amd64-{GORO_SHA}"),
+            format!("goro-linux-amd64-{GORO_SHA}.exe"),
+            format!("goro-linux-x86-{GORO_SHA}"),
+            format!("goro-plan9-amd64-{GORO_SHA}"),
+            "goro-linux-amd64-abc".to_string(),
+            "goro-linux-amd64-../x".to_string(),
+            format!("goro-linux-amd64-{GORO_SHA}/x"),
+            ".manifest.goroup.tmp".to_string(),
+        ] {
+            assert!(!goro_allowed_object_name(&bad), "should reject {bad}");
+        }
+        // Each channel only presigns its own names.
+        assert!(!allowed_object_name("manifest.goroup"));
+        assert_eq!(
+            object_key_for(Channel::Goro, "manifest.goroup").as_deref(),
+            Some("goro/main/manifest.goroup")
+        );
+        assert!(object_key_for(Channel::Goro, "manifest.jsonup").is_none());
+    }
+
+    #[test]
+    fn goro_listed_names_need_goro_magic() {
+        let sig = "a".repeat(128);
+        let sha = "c".repeat(64);
+        let linux = format!("goro-linux-amd64-{GORO_SHA}");
+        let windows = format!("goro-windows-amd64-{GORO_SHA}.exe");
+        let body = format!(
+            "GORO1SIG\n{sig}\nGORO1\nmain-2a6f056b3707\n1794955275\n2\n{linux}\n{sha}\n10\n{linux}\n{windows}\n{sha}\n11\n{windows}\n"
+        );
+        assert_eq!(
+            listed_object_names_for(Channel::Goro, body.as_bytes()).unwrap(),
+            [linux.clone(), windows.clone()]
+        );
+        // A goro manifest is not a Korangar one, and the other way round.
+        assert!(listed_object_names_for(Channel::Korangar, body.as_bytes()).is_err());
+        let krup = body.replace("GORO1", "KRUP1");
+        assert!(listed_object_names_for(Channel::Goro, krup.as_bytes()).is_err());
+        let evil = body.replacen(&format!("{linux}\n{sha}"), &format!("../.env\n{sha}"), 1);
+        assert!(listed_object_names_for(Channel::Goro, evil.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn presign_accepts_goro_prefix_only_for_goro_names() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_794_276_315);
+        let sign = |key: &str| {
+            presign_get(
+                "GKTEST",
+                "testsecret",
+                "garage",
+                "https://garage.turoran.com",
+                "korangar-releases",
+                key,
+                600,
+                now,
+            )
+        };
+        let url = sign("goro/main/manifest.goroup").unwrap();
+        assert!(url.starts_with(
+            "https://garage.turoran.com/korangar-releases/goro/main/manifest.goroup?"
+        ));
+        assert!(sign(&format!("goro/main/goro-windows-amd64-{GORO_SHA}.exe")).is_ok());
+        assert!(sign("goro/main/manifest.jsonup").is_err());
+        assert!(sign(&format!("main/goro-linux-amd64-{GORO_SHA}")).is_err());
+        assert!(sign(&format!("goro/main/korangar-linux-{GORO_SHA}")).is_err());
+        assert!(sign("goro/main/../main/manifest.jsonup").is_err());
+        assert!(sign("main/manifest.jsonup").is_ok());
     }
 
     #[test]

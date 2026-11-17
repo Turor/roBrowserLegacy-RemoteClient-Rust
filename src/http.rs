@@ -51,7 +51,14 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/assets/v1/manifest", get(crate::assets::manifest))
         .route("/api/assets/v1/blobs/{digest}", get(crate::assets::blob))
-        .route("/korangar/main/latest", get(crate::korangar_releases::latest))
+        .route(
+            "/korangar/main/latest",
+            get(crate::korangar_releases::latest),
+        )
+        .route(
+            "/goro/main/latest",
+            get(crate::korangar_releases::goro_latest),
+        )
         .route("/api/health", get(health))
         .route("/api/health/simple", get(health_simple))
         .route("/api/cache-stats", get(cache_stats))
