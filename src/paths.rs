@@ -125,10 +125,7 @@ mod tests {
             normalize(r"data\texture\유저인터페이스\btn.bmp"),
             normalize("data/texture/유저인터페이스/btn.bmp")
         );
-        assert_eq!(
-            normalize("DATA/Texture/A.BMP"),
-            "data/texture/a.bmp"
-        );
+        assert_eq!(normalize("DATA/Texture/A.BMP"), "data/texture/a.bmp");
     }
 
     #[test]
@@ -138,10 +135,7 @@ mod tests {
         assert_ne!(moji, korean);
         assert_eq!(decode_mojibake(&moji), korean);
         assert_eq!(moji, "À¯ÀúÀÎÅÍÆäÀÌ½º");
-        let enc: String = moji
-            .bytes()
-            .map(|b| format!("%{b:02X}"))
-            .collect();
+        let enc: String = moji.bytes().map(|b| format!("%{b:02X}")).collect();
         let decoded = decode_request_path(&format!("/data/texture/{enc}/scroll0down.bmp"));
         assert!(
             decode_mojibake(&decoded).contains(korean) || decoded.contains(korean),
@@ -242,7 +236,14 @@ mod tests {
 
     #[test]
     fn allowlist_applies_after_percent_decoding() {
-        for raw in ["/%2eenv", "/%2Eenv", "/data/%2e%2e/.env", "/data/..%5c.env", "/data%2f..%2f.env", "/%2e%65nv"] {
+        for raw in [
+            "/%2eenv",
+            "/%2Eenv",
+            "/data/%2e%2e/.env",
+            "/data/..%5c.env",
+            "/data%2f..%2f.env",
+            "/%2e%65nv",
+        ] {
             let d = decode_request_path(raw);
             assert!(!is_allowed_asset_path(&d), "should deny {raw} -> {d:?}");
         }

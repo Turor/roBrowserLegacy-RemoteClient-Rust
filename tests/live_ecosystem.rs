@@ -242,10 +242,7 @@ async fn izlude_is_modern_renewal_map() {
             eprintln!("ok izlude instance {url} {iw}x{ih}");
         }
 
-        eprintln!(
-            "ok modern izlude {gat_url} {w}x{h} {} bytes",
-            gat.len()
-        );
+        eprintln!("ok modern izlude {gat_url} {w}x{h} {} bytes", gat.len());
     }
 }
 
@@ -585,6 +582,10 @@ async fn working_folder_files_are_not_served() {
             .unwrap();
         assert!(res.status().is_success(), "{base}/batch");
         let body: Value = res.json().await.unwrap();
-        assert_eq!(body.as_object().map(|o| o.len()), Some(0), "{base}/batch leaked files");
+        assert_eq!(
+            body.as_object().map(|o| o.len()),
+            Some(0),
+            "{base}/batch leaked files"
+        );
     }
 }
