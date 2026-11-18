@@ -6,8 +6,8 @@ use crate::config::Config;
 use crate::metrics::HttpMetrics;
 use crate::ws;
 use axum::body::Body;
-use axum::extract::{Json, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Json, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,6 +25,7 @@ pub struct AppState {
     pub metrics: Arc<HttpMetrics>,
     pub asset_snapshot: Option<Arc<crate::assets::AssetSnapshot>>,
     pub korangar_releases: Option<Arc<crate::korangar_releases::Service>>,
+    pub data_version: Option<Arc<crate::data_version::DataVersion>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -46,7 +47,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::http::Method::OPTIONS,
             axum::http::Method::HEAD,
         ])
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers(tower_http::cors::Any)
+        .expose_headers([axum::http::header::HeaderName::from_static(
+            "x-data-version",
+        )]);
 
     Router::new()
         .route("/api/assets/v1/manifest", get(crate::assets::manifest))
@@ -71,8 +75,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/search", post(search))
         .route("/batch", post(batch))
         .route("/list-files", get(list_files))
+        .route("/version", get(data_version).head(data_version))
+        .route("/changes", get(changes))
+        .route("/data-manifest", get(data_manifest))
         .route("/ws/{*target}", get(ws::upgrade))
         .fallback(fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            data_version_mw,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             track_mw,
@@ -88,6 +99,81 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn track_mw(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     crate::metrics::track(state.metrics.clone(), req, next).await
+}
+
+async fn data_version_mw(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    if let Some(dv) = &state.data_version {
+        if let Ok(v) = HeaderValue::from_str(&dv.current().to_string()) {
+            res.headers_mut().insert(
+                axum::http::header::HeaderName::from_static(
+                    crate::data_version::DataVersion::header_name(),
+                ),
+                v,
+            );
+        }
+    }
+    res
+}
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    since: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ManifestQuery {
+    version: Option<u64>,
+}
+
+async fn data_version(State(state): State<Arc<AppState>>) -> Response {
+    let Some(dv) = &state.data_version else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut res = axum::Json(serde_json::json!({ "version": dv.current() })).into_response();
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    res
+}
+
+async fn changes(State(state): State<Arc<AppState>>, Query(q): Query<ChangesQuery>) -> Response {
+    let Some(dv) = &state.data_version else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = match q.since {
+        Some(since) => dv.changes_since(since),
+        None => crate::data_version::ChangesBody {
+            version: dv.current(),
+            paths: Vec::new(),
+            full: true,
+        },
+    };
+    let mut res = axum::Json(body).into_response();
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=5"),
+    );
+    res
+}
+
+async fn data_manifest(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ManifestQuery>,
+) -> Response {
+    let Some(dv) = &state.data_version else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(bytes) = dv.signed_manifest(q.version) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {

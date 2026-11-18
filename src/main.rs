@@ -13,11 +13,12 @@ mod bmp;
 mod cache;
 mod client;
 mod config;
+mod data_version;
 mod doctor;
 mod grf;
 mod http;
-mod korangar_releases;
 mod ini;
+mod korangar_releases;
 mod metrics;
 mod paths;
 mod ws;
@@ -112,6 +113,11 @@ async fn serve() -> Result<(), String> {
 
     let client = Client::init(config.clone())?;
     let http_metrics = metrics::HttpMetrics::new();
+    let data_version = if config.data_version {
+        Some(data_version::DataVersion::start(client.clone(), &config)?)
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         config: config.clone(),
         client: client.clone(),
@@ -120,9 +126,14 @@ async fn serve() -> Result<(), String> {
             .map(|path| assets::AssetSnapshot::open(std::path::Path::new(&path)).map(Arc::new))
             .transpose()?,
         korangar_releases: korangar_releases::Service::from_env().map(Arc::new),
+        data_version: data_version.clone(),
     });
     if state.korangar_releases.is_some() {
         info!("Korangar main-channel presign endpoint enabled");
+    }
+    if let Some(dv) = data_version {
+        info!(version = dv.current(), "data version header enabled");
+        tokio::spawn(dv.watch_loop());
     }
 
     metrics::spawn_reporter(config.clone(), client.clone(), http_metrics);

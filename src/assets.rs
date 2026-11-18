@@ -517,6 +517,7 @@ mod integration_tests {
                 metrics: HttpMetrics::new(),
                 asset_snapshot: enabled,
                 korangar_releases: None,
+                data_version: None,
             })
         };
         let app = crate::http::router(state(Some(snapshot)));

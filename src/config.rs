@@ -68,6 +68,10 @@ pub struct Config {
     pub influx_bucket: String,
     pub influx_host: String,
     pub influx_interval_secs: u64,
+    pub data_version: bool,
+    pub data_version_state_dir: PathBuf,
+    pub data_manifest_dir: PathBuf,
+    pub data_version_loose_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -150,6 +154,20 @@ impl Config {
             influx_bucket: env_string("INFLUX_BUCKET", "metrics"),
             influx_host: env_string("INFLUX_HOST", "rodata"),
             influx_interval_secs: env_usize("INFLUX_INTERVAL_SECS", 15) as u64,
+            data_version: env_bool("DATA_VERSION", false),
+            data_version_state_dir: PathBuf::from(env_string("DATA_VERSION_STATE_DIR", "state")),
+            data_manifest_dir: PathBuf::from(env_string("DATA_MANIFEST_DIR", "state/manifests")),
+            data_version_loose_root: std::env::var("DATA_VERSION_LOOSE_ROOT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    if env_bool("DATA_VERSION", false) {
+                        std::env::current_dir().ok()
+                    } else {
+                        None
+                    }
+                }),
         }
     }
 }
