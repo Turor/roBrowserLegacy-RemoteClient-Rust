@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Sign a canonical GDAT2ROOT file. Writes a detached root.sig.
+
+Usage:
+  scripts/sign-data-root --private-key PATH --root PATH [--out PATH]
+
+--private-key is required. It is a 32-byte Ed25519 seed or 64 lowercase
+or mixed-case hex characters. This script does not default that path.
+It never prints the seed. The signature is 128 lowercase hex characters
+and a trailing newline, over the exact root bytes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import binascii
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# PKCS#8 DER prefix for a 32-byte Ed25519 seed (RFC 8410).
+PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
+MAX_NEXT_KEYS = 8
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Sign a canonical GDAT2ROOT file")
+    parser.add_argument("--private-key", required=True, help="32-byte seed or 64 hex characters")
+    parser.add_argument("--root", required=True, help="canonical GDAT2ROOT file")
+    parser.add_argument("--out", help="destination root.sig (default: beside --root)")
+    args = parser.parse_args()
+
+    root_path = Path(args.root)
+    out_path = Path(args.out) if args.out else root_path.parent / "root.sig"
+    try:
+        data = root_path.read_bytes()
+    except OSError:
+        sys.stderr.write("cannot read --root\n")
+        return 1
+    if not valid_root(data):
+        sys.stderr.write("root is not a valid canonical GDAT2ROOT\n")
+        return 1
+    try:
+        seed = read_seed(args.private_key)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    try:
+        signature = sign_ed25519(seed, data)
+    except OSError:
+        sys.stderr.write("ed25519 sign failed\n")
+        return 1
+    payload = signature.hex() + "\n"
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    try:
+        tmp.write_text(payload, encoding="ascii")
+        os.replace(tmp, out_path)
+    except OSError:
+        sys.stderr.write("cannot write --out\n")
+        return 1
+    return 0
+
+
+def read_seed(path: str) -> bytes:
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise ValueError("cannot read the signing seed") from exc
+    seed = raw
+    text = raw.strip()
+    try:
+        decoded = text.decode("ascii")
+    except UnicodeDecodeError:
+        decoded = ""
+    if len(decoded) == 64:
+        try:
+            seed = binascii.unhexlify(decoded)
+        except binascii.Error:
+            seed = raw
+    if len(seed) != 32:
+        raise ValueError("signing seed must be 32 bytes or 64 hex characters")
+    if all(b == 0 for b in seed):
+        raise ValueError("refusing an all-zero seed")
+    return seed
+
+
+def sign_ed25519(seed: bytes, message: bytes) -> bytes:
+    der = PKCS8_PREFIX + seed
+    with tempfile.TemporaryDirectory(prefix="sign-data-root-") as tmp:
+        key_path = Path(tmp) / "key.der"
+        msg_path = Path(tmp) / "root"
+        sig_path = Path(tmp) / "sig"
+        key_path.write_bytes(der)
+        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+        msg_path.write_bytes(message)
+        result = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                str(key_path),
+                "-keyform",
+                "DER",
+                "-in",
+                str(msg_path),
+                "-out",
+                str(sig_path),
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0 or not sig_path.is_file():
+            raise OSError("openssl pkeyutl failed")
+        signature = sig_path.read_bytes()
+    if len(signature) != 64:
+        raise OSError("bad signature length")
+    return signature
+
+
+def valid_root(data: bytes) -> bool:
+    if not data.endswith(b"\n") or b"\r" in data or b"\0" in data:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    lines = text.split("\n")
+    lines.pop()
+    if len(lines) < 5 + 256 or lines[0] != "GDAT2ROOT":
+        return False
+    version = parse_u64(lines[1], allow_zero=False)
+    previous = parse_u64(lines[2], allow_zero=True)
+    created = parse_u64(lines[3], allow_zero=True)
+    if version is None or previous is None or created is None or lines[4] != "256":
+        return False
+    shards = []
+    for i in range(256):
+        parts = lines[5 + i].split(" ")
+        if len(parts) != 3:
+            return False
+        ident, digest, size_text = parts
+        if ident != f"{i:02x}" or not is_lower_hex(digest, 64):
+            return False
+        size = parse_u64(size_text, allow_zero=True)
+        if size is None:
+            return False
+        shards.append((ident, digest, size_text))
+    rest = lines[5 + 256 :]
+    next_keys = []
+    if rest:
+        if rest[0] != "next-keys" or len(rest) < 2:
+            return False
+        count = parse_u64(rest[1], allow_zero=False)
+        if count is None or count < 1 or count > MAX_NEXT_KEYS or len(rest) != 2 + count:
+            return False
+        for i in range(count):
+            key = rest[2 + i]
+            if not is_lower_hex(key, 64) or set(key) == {"0"}:
+                return False
+            if i > 0 and key <= next_keys[-1]:
+                return False
+            next_keys.append(key)
+    rebuilt = ["GDAT2ROOT", str(version), str(previous), str(created), "256"]
+    rebuilt.extend(f"{ident} {digest} {size}" for ident, digest, size in shards)
+    if next_keys:
+        rebuilt.append("next-keys")
+        rebuilt.append(str(len(next_keys)))
+        rebuilt.extend(next_keys)
+    canonical = "\n".join(rebuilt) + "\n"
+    return canonical.encode("utf-8") == data
+
+
+def parse_u64(text: str, allow_zero: bool) -> int | None:
+    if not text or (len(text) > 1 and text[0] == "0"):
+        return None
+    if any(c < "0" or c > "9" for c in text):
+        return None
+    try:
+        value = int(text, 10)
+    except ValueError:
+        return None
+    if value < 0 or value > 2**64 - 1:
+        return None
+    if value == 0 and not allow_zero:
+        return None
+    return value
+
+
+def is_lower_hex(text: str, size: int) -> bool:
+    if len(text) != size:
+        return False
+    return all(c in "0123456789abcdef" for c in text)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -63,11 +63,24 @@ struct Inner {
     changes: Vec<ChangeLine>,
 }
 
+struct SigSeen {
+    version: u64,
+    fingerprint: String,
+}
+
 pub struct DataVersion {
     inner: Mutex<Inner>,
     state_dir: PathBuf,
     manifest_dir: PathBuf,
     client: Arc<Client>,
+    sig_seen: Mutex<Option<SigSeen>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum V2Object {
+    Root,
+    Signature,
+    Shard(u8),
 }
 
 impl DataVersion {
@@ -94,18 +107,33 @@ impl DataVersion {
             archives,
             changes,
         };
-        if inner.version == 0 {
-            bump(&mut inner, &state_dir, snapshot, Vec::new(), false);
+        let (target, previous, full, do_bump) = if inner.version == 0 {
+            (next_version(0), 0, false, true)
         } else if inner.snapshot != snapshot {
-            bump(&mut inner, &state_dir, snapshot, Vec::new(), true);
+            (next_version(inner.version), inner.version, true, true)
+        } else {
+            (
+                inner.version,
+                previous_of(&inner.changes, inner.version),
+                false,
+                false,
+            )
+        };
+        crate::manifest_v2::publish(&client, &state_dir, &manifest_dir, target, previous)
+            .map_err(|e| format!("data manifest v2 export failed: {e}"))?;
+        if do_bump {
+            bump_to(&mut inner, &state_dir, target, snapshot, Vec::new(), full);
         }
         info!(version = inner.version, "data version tracking enabled");
-        Ok(Arc::new(Self {
+        let dv = Arc::new(Self {
             inner: Mutex::new(inner),
             state_dir,
             manifest_dir,
             client,
-        }))
+            sig_seen: Mutex::new(None),
+        });
+        dv.observe_signature_file(target);
+        Ok(dv)
     }
 
     pub fn current(&self) -> u64 {
@@ -184,6 +212,60 @@ impl DataVersion {
         read_regular(&path).or_else(|| read_regular(&self.manifest_dir.join("manifest.gdat")))
     }
 
+    pub fn read_v2(&self, version: u64, object: V2Object) -> Option<Vec<u8>> {
+        if version == 0 {
+            return None;
+        }
+        let dir = self.manifest_dir.join(version.to_string());
+        let path = match object {
+            V2Object::Root => dir.join("root"),
+            V2Object::Signature => dir.join("root.sig"),
+            V2Object::Shard(id) => dir.join("shards").join(format!("{id:02x}")),
+        };
+        let bytes = read_regular(&path)?;
+        if matches!(object, V2Object::Signature) {
+            self.observe_signature(version, &path, &bytes);
+        }
+        Some(bytes)
+    }
+
+    fn observe_signature_file(&self, version: u64) {
+        let path = self.manifest_dir.join(version.to_string()).join("root.sig");
+        let Some(bytes) = read_regular(&path) else {
+            return;
+        };
+        self.observe_signature(version, &path, &bytes);
+    }
+
+    fn observe_signature(&self, version: u64, path: &Path, bytes: &[u8]) {
+        let mtime = fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_default();
+        let fingerprint = format!("{mtime}:{}:{:x}", bytes.len(), Sha256::digest(bytes));
+        {
+            let seen = self.sig_seen.lock();
+            if let Some(prev) = seen.as_ref() {
+                if prev.version == version && prev.fingerprint == fingerprint {
+                    return;
+                }
+            }
+        }
+        let root = read_regular(&path.with_file_name("root")).unwrap_or_default();
+        let valid = crate::manifest_v2::signature_valid(&root, bytes);
+        if valid {
+            info!(version, "data manifest root.sig verified");
+        } else {
+            warn!(version, "data manifest root.sig failed verification");
+        }
+        *self.sig_seen.lock() = Some(SigSeen {
+            version,
+            fingerprint,
+        });
+    }
+
     pub fn watch_stamp(client: &Client) -> u128 {
         let mut n = 0u128;
         let mut roots = Vec::new();
@@ -194,8 +276,9 @@ impl DataVersion {
             roots.push(p.clone());
         }
         if let Some(p) = &client.config.data_version_loose_root {
-            roots.push(p.join("System"));
-            roots.push(p.join("data"));
+            for (dir, _) in crate::manifest_v2::loose_asset_dirs(p) {
+                roots.push(dir);
+            }
         }
         for root in roots {
             if !root.exists() {
@@ -238,7 +321,8 @@ impl DataVersion {
             }
             if let Some(t) = dirty_at {
                 if t.elapsed() >= std::time::Duration::from_secs(5) {
-                    self.rescan();
+                    let dv = Arc::clone(&self);
+                    let _ = tokio::task::spawn_blocking(move || dv.rescan()).await;
                     dirty_at = None;
                 }
             }
@@ -254,41 +338,73 @@ impl DataVersion {
             inner.archives = archives;
             return;
         }
-        let mut full = false;
-        let mut changed = BTreeSet::new();
-        for (path, fp) in &files {
-            match inner.files.get(path) {
-                Some(old) if old == fp => {}
-                _ => {
-                    changed.insert(path.clone());
-                }
-            }
+        let (paths, full) = changed_paths(&inner, &files, &archives);
+        let previous = inner.version;
+        let target = next_version(previous);
+        drop(inner);
+        if let Err(e) = crate::manifest_v2::publish(
+            &self.client,
+            &self.state_dir,
+            &self.manifest_dir,
+            target,
+            previous,
+        ) {
+            warn!("data manifest v2 export failed: {e}");
+            return;
         }
-        for path in inner.files.keys() {
-            if !files.contains_key(path) {
+        let mut inner = self.inner.lock();
+        inner.files = files;
+        inner.archives = archives;
+        bump_to(&mut inner, &self.state_dir, target, snapshot, paths, full);
+        drop(inner);
+        self.observe_signature_file(target);
+    }
+}
+
+fn previous_of(changes: &[ChangeLine], version: u64) -> u64 {
+    changes
+        .iter()
+        .rev()
+        .find(|c| c.version < version)
+        .map(|c| c.version)
+        .unwrap_or(0)
+}
+
+fn changed_paths(
+    inner: &Inner,
+    files: &BTreeMap<String, Fingerprint>,
+    archives: &BTreeMap<String, (u64, i64)>,
+) -> (Vec<String>, bool) {
+    let mut full = false;
+    let mut changed = BTreeSet::new();
+    for (path, fp) in files {
+        match inner.files.get(path) {
+            Some(old) if old == fp => {}
+            _ => {
                 changed.insert(path.clone());
             }
         }
-        for (path, ident) in &archives {
-            match inner.archives.get(path) {
-                Some(old) if old == ident => {}
-                Some(_) => full = true,
-                None => full = true,
-            }
+    }
+    for path in inner.files.keys() {
+        if !files.contains_key(path) {
+            changed.insert(path.clone());
         }
-        for path in inner.archives.keys() {
-            if !archives.contains_key(path) {
-                full = true;
-            }
+    }
+    for (path, ident) in archives {
+        match inner.archives.get(path) {
+            Some(old) if old == ident => {}
+            _ => full = true,
         }
-        let paths: Vec<String> = if full {
-            Vec::new()
-        } else {
-            changed.into_iter().collect()
-        };
-        inner.files = files;
-        inner.archives = archives;
-        bump(&mut inner, &self.state_dir, snapshot, paths, full);
+    }
+    for path in inner.archives.keys() {
+        if !archives.contains_key(path) {
+            full = true;
+        }
+    }
+    if full {
+        (Vec::new(), true)
+    } else {
+        (changed.into_iter().collect(), false)
     }
 }
 
@@ -296,23 +412,29 @@ fn next_version(last: u64) -> u64 {
     last.saturating_add(1).max(unix_now().max(1))
 }
 
-fn bump(inner: &mut Inner, state_dir: &Path, snapshot: String, paths: Vec<String>, full: bool) {
-    let next = next_version(inner.version);
+fn bump_to(
+    inner: &mut Inner,
+    state_dir: &Path,
+    version: u64,
+    snapshot: String,
+    paths: Vec<String>,
+    full: bool,
+) {
     let line = ChangeLine {
-        version: next,
+        version,
         at: Utc::now().to_rfc3339(),
         paths,
         full,
     };
-    inner.version = next;
-    inner.snapshot = snapshot.clone();
+    inner.version = version;
+    inner.snapshot = snapshot;
     inner.changes.push(line.clone());
     compact_changes(&mut inner.changes);
     if let Err(e) = persist(state_dir, inner) {
         warn!("data version persist failed: {e}");
     }
     info!(
-        version = next,
+        version,
         full,
         paths = line.paths.len(),
         "data version bumped"
@@ -409,15 +531,17 @@ fn snapshot_hash(
 fn scan(client: &Client) -> (BTreeMap<String, Fingerprint>, BTreeMap<String, (u64, i64)>) {
     let mut files = BTreeMap::new();
     let mut archives = BTreeMap::new();
+    // Serve order: loose cwd trees, then overlay, then data override, then GRF.
+    if let Some(root) = &client.config.data_version_loose_root {
+        for (dir, prefix) in crate::manifest_v2::loose_asset_dirs(root) {
+            collect_tree(&dir, &format!("{prefix}/"), &mut files);
+        }
+    }
     if let Some(root) = &client.config.overlay_path {
         collect_tree(root, "", &mut files);
     }
     if let Some(root) = &client.config.data_override_path {
         collect_tree(root, "data/", &mut files);
-    }
-    if let Some(root) = &client.config.data_version_loose_root {
-        collect_tree(&root.join("System"), "System/", &mut files);
-        collect_tree(&root.join("data"), "data/", &mut files);
     }
     for grf in &client.grfs {
         if let Ok(meta) = fs::metadata(&grf.path) {
@@ -430,6 +554,9 @@ fn scan(client: &Client) -> (BTreeMap<String, Fingerprint>, BTreeMap<String, (u6
             archives.insert(grf.path.display().to_string(), (meta.len(), mtime));
         }
         for entry in &grf.entries {
+            if !crate::manifest_v2::is_grf_payload(entry.flags) {
+                continue;
+            }
             let unicode = paths::decode_cp949(&entry.original_bytes);
             let Some(server) = server_path(&unicode) else {
                 continue;
@@ -449,7 +576,12 @@ fn collect_tree(root: &Path, prefix: &str, files: &mut BTreeMap<String, Fingerpr
     if !root.exists() {
         return;
     }
-    for ent in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for ent in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| e.ok())
+    {
         let path = ent.path();
         if !ent.file_type().is_file() {
             continue;
@@ -467,11 +599,12 @@ fn collect_tree(root: &Path, prefix: &str, files: &mut BTreeMap<String, Fingerpr
                 Some(s) => s,
                 None => continue,
             }
-        } else if prefix.eq_ignore_ascii_case("system/") {
-            format!("System/{rel}")
         } else {
             format!("{prefix}{rel}")
         };
+        if files.contains_key(&server) {
+            continue;
+        }
         if let Some(bytes) = read_regular(path) {
             files.insert(
                 server,
@@ -493,13 +626,8 @@ fn server_path(name: &str) -> Option<String> {
     {
         return None;
     }
-    if first.eq_ignore_ascii_case("data") {
-        Some(format!("data/{rest}"))
-    } else if first.eq_ignore_ascii_case("system") {
-        Some(format!("System/{rest}"))
-    } else {
-        None
-    }
+    let prefix = crate::manifest_v2::canonical_asset_root(first)?;
+    Some(format!("{prefix}/{rest}"))
 }
 
 fn read_regular(path: &Path) -> Option<Vec<u8>> {
@@ -541,6 +669,7 @@ mod tests {
         config.data_version = true;
         config.data_version_state_dir = root.join("state");
         config.data_manifest_dir = root.join("state/manifests");
+        config.data_version_loose_root = None;
         Client::init(config).unwrap()
     }
 
@@ -701,6 +830,353 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["full"], true);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/data-manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"GDAT1SIG"));
+    }
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn rich_client(root: &Path) -> Arc<Client> {
+        fs::create_dir_all(root.join("BGM")).unwrap();
+        fs::write(root.join("BGM/theme.mp3"), b"theme").unwrap();
+        fs::write(root.join("BGM/.hidden.mp3"), b"nope").unwrap();
+        fs::create_dir_all(root.join("AI")).unwrap();
+        fs::write(root.join("AI/test.mtd"), b"ai-body").unwrap();
+        fs::create_dir_all(root.join("System")).unwrap();
+        fs::write(root.join("System/itemInfo.lua"), b"item").unwrap();
+        fs::write(root.join("System/.gitkeep"), b"x").unwrap();
+        fs::create_dir_all(root.join("data/texture")).unwrap();
+        fs::write(root.join("data/texture/abc.bmp"), b"bmp-loose").unwrap();
+        fs::create_dir_all(root.join("overrides/texture")).unwrap();
+        fs::write(root.join("overrides/texture/abc.bmp"), b"override-bmp").unwrap();
+        fs::write(root.join("overrides/keep.txt"), b"override-keep").unwrap();
+        fs::write(root.join("DATA.INI"), "[Data]\n0=first.grf\n1=second.grf\n").unwrap();
+        fs::write(
+            root.join("first.grf"),
+            build_test_grf_200(&[
+                ("data\\hello.txt", b"grf-hello"),
+                ("data\\keep.txt", b"first-keep"),
+                ("data\\duel.txt", b"one"),
+                ("BGM\\only-grf.mp3", b"from-grf"),
+            ]),
+        )
+        .unwrap();
+        fs::write(
+            root.join("second.grf"),
+            build_test_grf_200(&[
+                ("data\\keep.txt", b"second-keep"),
+                ("data\\duel.txt", b"two"),
+                ("data\\second-only.txt", b"second"),
+            ]),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("overlays/data")).unwrap();
+        fs::write(root.join("overlays/data/hello.txt"), b"overlay-hello").unwrap();
+        let mut config = Config::from_env();
+        config.client_respath = root.into();
+        config.client_dataini = "DATA.INI".into();
+        config.overlay_path = Some(root.join("overlays"));
+        config.data_override_path = Some(root.join("overrides"));
+        config.path_mapping_file = root.join("no-mapping.json");
+        config.auto_extract = false;
+        config.enable_static_serve = false;
+        config.enable_wsproxy = false;
+        config.data_version = true;
+        config.data_version_state_dir = root.join("state");
+        config.data_manifest_dir = root.join("state/manifests");
+        config.data_version_loose_root = Some(root.to_path_buf());
+        Client::init(config).unwrap()
+    }
+
+    fn manifest_entry(root: &Path, version: u64, key: &str) -> (String, u64) {
+        let id = crate::manifest_v2::shard_id(key);
+        let text = fs::read_to_string(
+            root.join("state/manifests")
+                .join(version.to_string())
+                .join("shards")
+                .join(&id),
+        )
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "GDAT2SHARD");
+        assert_eq!(lines[1], version.to_string());
+        assert_eq!(lines[2], id);
+        let count: usize = lines[3].parse().unwrap();
+        assert_eq!(lines.len(), 4 + count * 3);
+        for i in 0..count {
+            if lines[4 + i * 3] == key {
+                return (
+                    lines[5 + i * 3].to_string(),
+                    lines[6 + i * 3].parse().unwrap(),
+                );
+            }
+        }
+        panic!("missing manifest entry {key}");
+    }
+
+    #[test]
+    fn v2_hashes_served_bytes_and_keeps_identical_shards() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let client = rich_client(root.path());
+        let dv = DataVersion::start(client.clone(), &client.config).unwrap();
+        let v1 = dv.current();
+        let manifest = root.path().join("state/manifests").join(v1.to_string());
+        assert!(manifest.join("root").is_file());
+        assert!(!manifest.join("root.sig").exists());
+        for i in 0..256 {
+            assert!(manifest.join("shards").join(format!("{i:02x}")).is_file());
+        }
+        let root_text = fs::read_to_string(manifest.join("root")).unwrap();
+        let lines: Vec<&str> = root_text.lines().collect();
+        assert_eq!(lines[0], "GDAT2ROOT");
+        assert_eq!(lines[1], v1.to_string());
+        assert_eq!(lines[2], "0");
+        assert_eq!(lines[4], "256");
+        assert_eq!(lines.len(), 261);
+        for i in 0..256 {
+            let id = format!("{i:02x}");
+            let bytes = fs::read(manifest.join("shards").join(&id)).unwrap();
+            let expect = format!("{id} {} {}", sha_hex(&bytes), bytes.len());
+            assert_eq!(lines[5 + i], expect);
+            assert!(std::str::from_utf8(&bytes)
+                .unwrap()
+                .starts_with("GDAT2SHARD\n"));
+        }
+
+        let (hello_sha, hello_len) = manifest_entry(root.path(), v1, "hello.txt");
+        assert_eq!(hello_sha, sha_hex(b"overlay-hello"));
+        assert_eq!(hello_len, b"overlay-hello".len() as u64);
+        let (keep_sha, _) = manifest_entry(root.path(), v1, "keep.txt");
+        assert_eq!(keep_sha, sha_hex(b"override-keep"));
+        let (bmp_sha, _) = manifest_entry(root.path(), v1, "texture/abc.bmp");
+        assert_eq!(bmp_sha, sha_hex(b"bmp-loose"));
+        let (duel_sha, _) = manifest_entry(root.path(), v1, "duel.txt");
+        assert_eq!(duel_sha, sha_hex(b"one"));
+        let (grf_bgm, grf_len) = manifest_entry(root.path(), v1, "bgm/only-grf.mp3");
+        assert_eq!(grf_bgm, sha_hex(b"from-grf"));
+        assert_eq!(grf_len, b"from-grf".len() as u64);
+        let (theme, _) = manifest_entry(root.path(), v1, "bgm/theme.mp3");
+        assert_eq!(theme, sha_hex(b"theme"));
+        let (ai, _) = manifest_entry(root.path(), v1, "ai/test.mtd");
+        assert_eq!(ai, sha_hex(b"ai-body"));
+        let (lua_sha, _) = manifest_entry(root.path(), v1, "system/iteminfo.lua");
+        assert_eq!(lua_sha, sha_hex(b"item"));
+        let (second_sha, _) = manifest_entry(root.path(), v1, "second-only.txt");
+        assert_eq!(second_sha, sha_hex(b"second"));
+        let joined = fs::read_to_string(manifest.join("shards").join("00")).unwrap()
+            + &fs::read_to_string(manifest.join("root")).unwrap();
+        assert!(!joined.contains(".gitkeep"));
+        assert!(!joined.contains("hidden"));
+
+        let shard31 = manifest.join("shards").join("31");
+        let ino = fs::metadata(&shard31).unwrap().ino();
+        let again = crate::manifest_v2::publish(
+            &client,
+            &client.config.data_version_state_dir,
+            &client.config.data_manifest_dir,
+            v1,
+            0,
+        )
+        .unwrap();
+        assert!(again.cache_hits > 0);
+        assert_eq!(again.shards_written, 0);
+        assert!(!again.root_written);
+        assert_eq!(fs::metadata(&shard31).unwrap().ino(), ino);
+
+        fs::write(root.path().join("System/itemInfo.lua"), b"item-2").unwrap();
+        dv.rescan();
+        let v2 = dv.current();
+        assert!(v2 > v1);
+        let root2 = fs::read_to_string(
+            root.path()
+                .join("state/manifests")
+                .join(v2.to_string())
+                .join("root"),
+        )
+        .unwrap();
+        let lines2: Vec<&str> = root2.lines().collect();
+        assert_eq!(lines2[1], v2.to_string());
+        assert_eq!(lines2[2], v1.to_string());
+        let (lua2, _) = manifest_entry(root.path(), v2, "system/iteminfo.lua");
+        assert_eq!(lua2, sha_hex(b"item-2"));
+        let (bmp2, _) = manifest_entry(root.path(), v2, "texture/abc.bmp");
+        assert_eq!(bmp2, bmp_sha);
+        let old_theme = fs::read(
+            root.path()
+                .join("state/manifests")
+                .join(v1.to_string())
+                .join("shards")
+                .join("24"),
+        )
+        .unwrap();
+        let new_theme = fs::read(
+            root.path()
+                .join("state/manifests")
+                .join(v2.to_string())
+                .join("shards")
+                .join("24"),
+        )
+        .unwrap();
+        assert_ne!(old_theme, new_theme);
+        assert!(std::str::from_utf8(&new_theme)
+            .unwrap()
+            .contains(&format!("\n{v2}\n")));
+    }
+
+    #[tokio::test]
+    async fn v2_http_endpoints_keep_legacy_manifest() {
+        use crate::http::{router, AppState};
+        use crate::metrics::HttpMetrics;
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let client = rich_client(root.path());
+        let dv = DataVersion::start(client.clone(), &client.config).unwrap();
+        let v = dv.current();
+        fs::write(
+            root.path().join(format!("state/manifests/{v}.gdat")),
+            b"GDAT1SIG\n00\nGDAT1\n",
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            config: client.config.clone(),
+            client: client.clone(),
+            metrics: HttpMetrics::new(),
+            asset_snapshot: None,
+            korangar_releases: None,
+            data_version: Some(dv.clone()),
+        });
+        let app = router(state);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/data-manifest/root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-cache"
+        );
+        assert_eq!(
+            res.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(res.headers().get(axum::http::header::ETAG).is_some());
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"GDAT2ROOT\n"));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/data-manifest/v/{v}/shards/31"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/data-manifest/v/{v}/shards/FF"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/data-manifest/v/01/root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/data-manifest/v/999999/root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/data-manifest/root.sig")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+
+        fs::write(
+            root.path()
+                .join("state/manifests")
+                .join(v.to_string())
+                .join("root.sig"),
+            b"abcd\n",
+        )
+        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/data-manifest/v/{v}/root.sig"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-cache"
+        );
+
         let res = app
             .oneshot(
                 Request::builder()

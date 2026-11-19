@@ -19,6 +19,7 @@ mod grf;
 mod http;
 mod ini;
 mod korangar_releases;
+mod manifest_v2;
 mod metrics;
 mod paths;
 mod ws;

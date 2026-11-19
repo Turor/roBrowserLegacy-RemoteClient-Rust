@@ -33,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 hmac = "0.12"
 walkdir = "2"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 
 [dev-dependencies]
 tempfile = "3"

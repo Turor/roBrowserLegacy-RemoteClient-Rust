@@ -3,6 +3,7 @@
 use crate::cache::etag_for;
 use crate::client::Client;
 use crate::config::Config;
+use crate::data_version::V2Object;
 use crate::metrics::HttpMetrics;
 use crate::ws;
 use axum::body::Body;
@@ -78,6 +79,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/version", get(data_version).head(data_version))
         .route("/changes", get(changes))
         .route("/data-manifest", get(data_manifest))
+        .route("/data-manifest/root", get(v2_root_current))
+        .route("/data-manifest/root.sig", get(v2_sig_current))
+        .route("/data-manifest/shards/{hh}", get(v2_shard_current))
+        .route("/data-manifest/v/{version}/root", get(v2_root))
+        .route("/data-manifest/v/{version}/root.sig", get(v2_sig))
+        .route("/data-manifest/v/{version}/shards/{hh}", get(v2_shard))
         .route("/ws/{*target}", get(ws::upgrade))
         .fallback(fallback)
         .layer(axum::middleware::from_fn_with_state(
@@ -174,6 +181,118 @@ async fn data_manifest(
         bytes,
     )
         .into_response()
+}
+
+async fn v2_root_current(State(state): State<Arc<AppState>>) -> Response {
+    v2_current(&state, V2Object::Root, "no-cache").await
+}
+
+async fn v2_sig_current(State(state): State<Arc<AppState>>) -> Response {
+    v2_current(&state, V2Object::Signature, "no-cache").await
+}
+
+async fn v2_shard_current(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(hh): axum::extract::Path<String>,
+) -> Response {
+    let Some(id) = parse_shard_id(&hh) else {
+        return (StatusCode::BAD_REQUEST, "bad shard").into_response();
+    };
+    v2_current(&state, V2Object::Shard(id), "no-cache").await
+}
+
+async fn v2_root(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(version): axum::extract::Path<String>,
+) -> Response {
+    v2_versioned(&state, &version, V2Object::Root, IMMUTABLE).await
+}
+
+async fn v2_sig(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(version): axum::extract::Path<String>,
+) -> Response {
+    v2_versioned(&state, &version, V2Object::Signature, "no-cache").await
+}
+
+async fn v2_shard(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((version, hh)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(id) = parse_shard_id(&hh) else {
+        return (StatusCode::BAD_REQUEST, "bad shard").into_response();
+    };
+    v2_versioned(&state, &version, V2Object::Shard(id), IMMUTABLE).await
+}
+
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+async fn v2_current(state: &AppState, object: V2Object, cache: &'static str) -> Response {
+    let Some(dv) = &state.data_version else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    v2_body(dv, dv.current(), object, cache)
+}
+
+async fn v2_versioned(
+    state: &AppState,
+    version: &str,
+    object: V2Object,
+    cache: &'static str,
+) -> Response {
+    let Some(dv) = &state.data_version else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(version) = parse_version(version) else {
+        return (StatusCode::BAD_REQUEST, "bad version").into_response();
+    };
+    v2_body(dv, version, object, cache)
+}
+
+fn v2_body(
+    dv: &crate::data_version::DataVersion,
+    version: u64,
+    object: V2Object,
+    cache: &'static str,
+) -> Response {
+    let Some(bytes) = dv.read_v2(version, object) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let etag = crate::manifest_v2::short_etag(&bytes);
+    let mut res = (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, cache),
+        ],
+        bytes,
+    )
+        .into_response();
+    if let Ok(value) = header::HeaderValue::from_str(&etag) {
+        res.headers_mut().insert(header::ETAG, value);
+    }
+    res
+}
+
+fn parse_version(text: &str) -> Option<u64> {
+    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    if !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let version = text.parse().ok()?;
+    if version == 0 {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+fn parse_shard_id(text: &str) -> Option<u8> {
+    if text.len() != 2 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    u8::from_str_radix(text, 16).ok()
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
