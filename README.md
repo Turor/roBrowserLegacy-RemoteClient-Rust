@@ -73,6 +73,7 @@ Optional: set `ROBROWSER_PATH` to your roBrowserLegacy checkout and open:
 | `ENABLE_STATIC_SERVE` | `true` | Serve `ROBROWSER_PATH` |
 | `DATA_OVERRIDE_PATH` | unset | Loose client `data/` |
 | `CLIENT_AUTOEXTRACT` | `true` | Write GRF hits to disk |
+| `DATA_VERSION` | `false` | Stamp `X-Data-Version`, serve `/version` and `/changes` (see `docs/data-version.md`) |
 
 ## Layout
 

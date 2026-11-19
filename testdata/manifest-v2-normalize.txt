@@ -1,0 +1,27 @@
+# Manifest v2 path normalization vectors.
+# Columns are TAB-separated: input, expected, shard.
+# expected is the normalized path, or REJECT.
+# shard is the two-hex shard id of the normalized path, or - if REJECT.
+# A row whose input contains % is DecodeThenNormalize. Every other row is NormalizeManifestPath.
+data\Texture\ABC.bmp	texture/abc.bmp	31
+Data/texture/abc.bmp	texture/abc.bmp	31
+DATA//texture\\ABC.bmp	texture/abc.bmp	31
+/data/texture/abc.bmp	texture/abc.bmp	31
+./data/texture/abc.bmp	texture/abc.bmp	31
+data/texture/abc.bmp/	texture/abc.bmp	31
+texture//abc.bmp	texture/abc.bmp	31
+data/data/foo	data/foo	0a
+System/itemInfo.lua	system/iteminfo.lua	42
+BGM\theme.mp3	bgm/theme.mp3	24
+AI/test.mtd	ai/test.mtd	56
+lua files\\skillinfoz\\skillid.lub	lua files/skillinfoz/skillid.lub	ae
+texture/유저인터페이스/login_interface/titlebar_left.bmp	texture/유저인터페이스/login_interface/titlebar_left.bmp	62
+texture/유.bmp	texture/유.bmp	60
+data	REJECT	-
+data/	REJECT	-
+	REJECT	-
+data/../secret	REJECT	-
+texture/foo/../bar.bmp	REJECT	-
+C:\data\x	REJECT	-
+data/texture/%EC%9C%A0.bmp	texture/유.bmp	60
+data/texture/%2e%2e/secret	REJECT	-
